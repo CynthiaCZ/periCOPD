@@ -1,0 +1,204 @@
+---
+title: "train lasso score with impulse genes"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_collapsed: true
+    toc_depth: 3
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+---
+
+```{r}
+library(data.table)
+library(dplyr)
+library(stringr)
+library(tibble) 
+library(ggplot2)
+library(glmnet)
+options(bitmapType='cairo')
+```
+
+# load data
+```{r}
+counts_raw <- fread("path/to/limma_corrected_allSamples.csv", data.table = F)
+weekly_exac <- fread("path/to/periCOPD_exac_weekly.csv", data.table = F)
+gene_id_to_name <- read.csv("path/to/gene_id_to_name_map.csv")
+
+weekly_exac <- weekly_exac %>%
+  mutate(week_num = as.integer(str_extract(study_week, "(?<=week_)\\d+"))) %>%
+  mutate(week_num = if_else(is.na(week_num), 0L, week_num))
+
+# removed S1003 week 10 since missing from pheno
+counts <- merge(counts_raw, weekly_exac %>% dplyr::select(SID, week_num, exacerbation_week_flag), by.x = c("subject_id", "week_num"), by.y = c("SID", "week_num")) %>%
+  relocate(exacerbation_week_flag, .after = week_num) %>%
+  arrange(subject_id, week_num)
+```
+
+## top genes from impulse
+```{r}
+# in any subjects
+long_list <- read.csv("path/to/impulseDE_top50perc_transient_centered0_genes_norm_overlap_count_all.csv")
+nrow(long_list)
+# in at least 2
+short_list <- read.csv("path/to/impulseDE_top50perc_transient_centered0_genes_norm_overlap_count.csv")
+nrow(short_list)
+# WGCNA AMEND module genes
+short_in_blue <- read.table(file = "path/to/short_in_blue_nodes_adj0.95_n20_fin.txt", sep = "\t", header=TRUE)
+
+
+exac <- counts$exacerbation_week_flag
+counts_top_long <- counts %>% select(all_of(long_list$gene_id))
+counts_top_short <- counts %>% select(all_of(short_list$gene_id))
+counts_top_module <- counts %>% select(all_of(short_in_blue$ENSG_ID))
+
+counts_top_long_mat <- as.matrix(counts_top_long)
+counts_top_short_mat <- as.matrix(counts_top_short)
+counts_top_module_mat <- as.matrix(counts_top_module)
+
+# adjust for subject ids
+X_subject <- model.matrix(~ subject_id, data = counts)[, -1, drop = FALSE]
+X_long <- cbind(counts_top_long_mat, X_subject)
+X_short <- cbind(counts_top_short_mat, X_subject)
+X_module <- cbind(counts_top_module_mat, X_subject)
+
+# no penalty for subject ids if adjusting
+pf_long <- c(rep(1, ncol(counts_top_long_mat)), rep(0, ncol(X_subject)))
+pf_short <- c(rep(1, ncol(counts_top_short_mat)), rep(0, ncol(X_subject)))
+pf_module <- c(rep(1, ncol(counts_top_module_mat)), rep(0, ncol(X_subject)))
+
+# if not adjusting for subject id put each subject in a fold
+subj_id_fold <- match(counts$subject_id, unique(counts$subject_id))
+
+# weights for class imbalance
+pos_wt <- mean(exac == 0)
+neg_wt <- mean(exac == 1)
+obs_wt <- ifelse(exac == 1, pos_wt, neg_wt)
+```
+
+# correlation heatmap
+```{r}
+library(pheatmap)
+
+cor_exac1 <- cor(counts_top_short_mat[exac == 1, , drop = FALSE], use = "pairwise.complete.obs")
+cor_exac0 <- cor(counts_top_short_mat[exac == 0, , drop = FALSE], use = "pairwise.complete.obs")
+
+id2name <- setNames(gene_id_to_name$Gene_Name, gene_id_to_name$Gene_ID)
+
+gene_names <- id2name[colnames(counts_top_short_mat)]
+colnames(cor_exac1) <- rownames(cor_exac1) <- gene_names
+colnames(cor_exac0) <- rownames(cor_exac0) <- gene_names
+
+pheatmap(cor_exac1, fontsize_row=6, fontsize_col=6, cluster_rows = F, cluster_cols = F)
+pheatmap(cor_exac0, fontsize_row=6, fontsize_col=6, cluster_rows = F, cluster_cols = F)
+
+```
+
+```{r}
+# module genes
+cor_exac1 <- cor(counts_top_module_mat[exac == 1, , drop = FALSE], use = "pairwise.complete.obs")
+
+cor_exac0 <- cor(counts_top_module_mat[exac == 0, , drop = FALSE], use = "pairwise.complete.obs")
+
+id2name <- setNames(gene_id_to_name$Gene_Name, gene_id_to_name$Gene_ID)
+
+gene_names <- id2name[colnames(counts_top_module_mat)]
+colnames(cor_exac1) <- rownames(cor_exac1) <- gene_names
+colnames(cor_exac0) <- rownames(cor_exac0) <- gene_names
+
+pheatmap(cor_exac1, fontsize_row=6, fontsize_col=6, cluster_rows = F, cluster_cols = F)
+pheatmap(cor_exac0, fontsize_row=6, fontsize_col=6, cluster_rows = F, cluster_cols = F)
+# more correlated at non exac??
+```
+
+# WGCNA AMEND gene module ada lasso
+## one fold for each subject
+```{r}
+set.seed(1)
+ridge_module_subj_fold <- cv.glmnet(
+  x = counts_top_module_mat,
+  y = exac,
+  type.measure = "deviance",
+  family = "binomial",
+  alpha = 0,
+  foldid = subj_id_fold,
+  weights = obs_wt,
+  standardize = TRUE
+)
+ridge_coef_module_subj_fold <- as.numeric(coef(ridge_module_subj_fold, s = "lambda.min"))[-1]
+w_module_subj_fold <- 1 / abs(ridge_coef_module_subj_fold)
+
+adalasso_module_subj_fold <- cv.glmnet(
+  x = counts_top_module_mat,
+  y = exac,
+  type.measure = "auc",
+  family = "binomial",
+  alpha = 1,
+  foldid = subj_id_fold,
+  weights = obs_wt,
+  standardize = TRUE,
+  penalty.factor = w_module_subj_fold
+)
+
+coef_adalasso_module_subj_fold <- coef(adalasso_module_subj_fold, s = "lambda.min")
+cat("number of genes selected: ", sum(coef_adalasso_module_subj_fold != 0 & grepl("^ENSG", rownames(coef_adalasso_module_subj_fold))))
+```
+
+```{r}
+plot(adalasso_module_subj_fold)
+abline(v = -log(adalasso_module_subj_fold$lambda.min),
+       col = "red", lwd = 2)
+```
+
+## adjust for subject id
+```{r}
+set.seed(1)
+ridge_module_adj_subj <- cv.glmnet(
+  x = X_module,
+  y = exac,
+  type.measure = "deviance",
+  family = "binomial",
+  alpha = 0,
+  nfolds = 4,
+  weights = obs_wt,
+  standardize = TRUE,
+  penalty.factor = pf_module
+)
+ridge_coef_module_adj_all <- as.numeric(coef(ridge_module_adj_subj, s = "lambda.min"))[-1]
+
+# subject weights stay 0
+w_genes  <- 1 / abs(ridge_coef_module_adj_all[seq_len(nrow(short_in_blue))])
+w_subj   <- rep(0, ncol(X_subject))
+pf_adapt_module <- c(w_genes, w_subj)
+
+adalasso_module_adj_subj <- cv.glmnet(
+  x = X_module,
+  y = exac,
+  type.measure = "auc",
+  family = "binomial",
+  alpha = 1,
+  nfolds = 4,
+  weights = obs_wt,
+  standardize = TRUE,
+  penalty.factor = pf_adapt_module
+)
+
+coef_adalasso_module_adj_subj <- coef(adalasso_module_adj_subj, s = "lambda.min")
+cat("number of genes selected: ", sum(coef_adalasso_module_adj_subj != 0 & grepl("^ENSG", rownames(coef_adalasso_module_adj_subj))))
+```
+
+```{r}
+df_coef_adalasso_module_adj_subj <- as.data.frame(as.matrix(coef_adalasso_module_adj_subj))
+df_coef_adalasso_module_adj_subj$feature <- rownames(df_coef_adalasso_module_adj_subj)
+
+df_coef_adalasso_module_subj_fold <- as.data.frame(as.matrix(coef_adalasso_module_subj_fold))
+df_coef_adalasso_module_subj_fold$feature <- rownames(df_coef_adalasso_module_subj_fold)
+
+coef_compare_ada_module <- merge(df_coef_adalasso_module_adj_subj, df_coef_adalasso_module_subj_fold, by = "feature", all = TRUE, suffixes = c("_ada_adj_subj", "_ada_subj_fold"))
+coef_compare_ada_module <- coef_compare_ada_module %>% filter(grepl("^ENSG", feature))
+
+coef_compare_ada_module <- merge(coef_compare_ada_module, gene_id_to_name, by.x = "feature", by.y = "Gene_ID")
+
+DT::datatable(coef_compare_ada_module %>% arrange(desc(abs(lambda.min_ada_subj_fold))), options = list(autoWidth = TRUE, scrollX = '400px'))
+write.csv(coef_compare_ada_module, "data/impulse_gene_score_WGCNA_AMEND_adalasso.csv", quote = F, row.names = F)
+```

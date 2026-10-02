@@ -1,0 +1,871 @@
+---
+title: "ImpulseDE2 individual top 50 percent highly expressed genes"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_collapsed: true
+    toc_depth: 4
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+---
+
+```{r}
+library(ggplot2)
+library(tidyverse)
+library(data.table)
+library(readxl)
+library(ImpulseDE2)
+library(pheatmap)
+library(ComplexHeatmap)
+library(grid)
+library(igraph)
+
+options(bitmapType='cairo')
+```
+
+# functions
+```{r}
+# filter transient genes centered at 0
+get_impulse_params <- function(transient_df, model_fits, max_width = 3) {
+  results <- lapply(transient_df$ensembl_id, function(gene_id) {
+    fit <- model_fits[[gene_id]]$lsImpulseFit
+    
+    params <- fit$vecImpulseParam
+    start_level <- params[2] #h0
+    peak_level <- params[3] #h1
+    end_level <- params[4] #h2
+    start_time <- params[5] #t1
+    end_time <- params[6] #t2
+    
+    peak_width <- end_time - start_time
+    peak_time <- mean(c(start_time, end_time))
+    peak_amp_ratio <- pmax(peak_level, start_level) / pmin(peak_level, start_level)
+
+    return(data.frame(
+      start_level=start_level, peak_level=peak_level, end_level=end_level,
+      start_time=start_time, end_time=end_time, 
+      peak_width=peak_width, peak_time=peak_time, peak_amp_ratio=peak_amp_ratio
+    ))
+  })
+  
+  results_df <- do.call(rbind, results)
+  return(cbind(transient_df, results_df))
+}
+
+plot_impulse <- function(gene_ids, objectImpulseDE2){
+
+  lsgplotsGenes <- plotGenes(
+    vecGeneIDs       = gene_ids,
+    scaNTopIDs       = NULL,
+    objectImpulseDE2 = objectImpulseDE2,
+    boolCaseCtrl     = FALSE,
+    boolSimplePlot   = FALSE,
+    dirOut           = NULL,
+    strFileName      = NULL,
+    vecRefPval       = NULL, 
+    strNameRefMethod = NULL)
+  
+  lsgplotsGenes <- lapply(lsgplotsGenes, function(p) {
+    parts <- strsplit(p$labels$title, ":", fixed = TRUE)[[1]]
+    gene_id <- parts[1]
+    # log10q <- parts[2]
+    gene_name <- gene_id_to_name$Gene_Name[match(gene_id, gene_id_to_name$Gene_ID)]
+    # p + ggtitle(paste0(gene_name, ":", log10q)) + xlab("Time [weeks]")
+    p + ggtitle(paste0(gene_name, " (", gene_id, ")")) + xlab("Time [weeks]")
+  })
+return(lsgplotsGenes)
+}
+
+
+plot_normalized <- function(gene_ids, counts_df) {
+
+  plots <- lapply(gene_ids, function(gene_id) {
+    gene_symbol <- gene_id_to_name$Gene_Name[gene_id_to_name$Gene_ID == gene_id]
+
+    df_gene <- counts_df %>%
+      dplyr::select(time, all_of(gene_id))
+
+    ggplot(df_gene, aes(x = .data[["time"]], y = .data[[gene_id]])) +
+      geom_line(color = "steelblue") +
+      geom_point(size = 2) +
+      theme_minimal() +
+      labs(
+        title = paste0(gene_symbol, " (", gene_id, ")"),
+        x = "Time",
+        y = "Expression"
+      )
+  })
+  return(plots)
+}
+
+
+```
+
+```{r}
+get_sigmoid_params <- function(sigmoid_df, model_fits, objectImpulseDE2) {
+  results <- lapply(sigmoid_df$ensembl_id, function(gene_id) {
+    fit <- model_fits[[gene_id]]$lsSigmoidFit
+
+    params <- fit$vecSigmoidParam
+    beta <- params[1]
+    start_level <- params[2] #h0
+    end_level <- params[3] #h1
+    infl_point <- params[4]  # inflection point
+    peak_amp_ratio <- pmax(end_level, start_level) / pmin(end_level, start_level)
+    
+    observed <- as.numeric(objectImpulseDE2@matCountDataProc[gene_id, ])
+    fitted <- fit$vecSigmoidValue
+    # mse <- mean((observed - fitted)^2, na.rm = TRUE)
+    obs_z  <- as.numeric(scale(observed))
+    fit_z  <- as.numeric(scale(fitted))
+    mse_z  <- mean((obs_z - fit_z)^2, na.rm = TRUE)
+
+    return(data.frame(
+      beta=beta, start_level=start_level, end_level=end_level, infl_point=infl_point, 
+      peak_amp_ratio=peak_amp_ratio, mse_z=mse_z
+    ))
+  })
+
+  results_df <- do.call(rbind, results)
+  return(cbind(sigmoid_df, results_df))
+}
+
+plot_sigmoid <- function(gene_ids, objectImpulseDE2) {
+  plots <- lapply(gene_ids, function(gene_id) {
+      fit <- objectImpulseDE2@lsModelFits$case[[gene_id]]$lsSigmoidFit
+
+      t_vals <- objectImpulseDE2@dfAnnotationProc$Time
+      sigmoid_vals <- fit$vecSigmoidValue
+      data_fit <- data.frame(Time = t_vals, Expression = sigmoid_vals)
+  
+      count_data <- objectImpulseDE2@matCountDataProc[gene_id, ]
+      data_raw <- data.frame(Time = t_vals, Expression = count_data)
+  
+      gene_name <- gene_id_to_name$Gene_Name[match(gene_id, gene_id_to_name$Gene_ID)]
+  
+      ggplot() +
+        geom_point(data = data_raw, aes(x = Time, y = Expression), alpha = 0.5) +
+        geom_line(data = data_fit, aes(x = Time, y = Expression), color = "red", size = 1) +
+        ggtitle(gene_name) +
+        xlab("Time [weeks]") + ylab("Normalized expression") +
+        theme_minimal()
+    })
+  
+  return(plots)
+}
+
+```
+
+```{r}
+get_gene_overlap <- function(df1, df2, df3, df4, gene_id_to_name) {
+  gene_lists <- list(
+    df1 = df1$ensembl_id,
+    df2 = df2$ensembl_id,
+    df3 = df3$ensembl_id,
+    df4 = df4$ensembl_id
+  )
+  
+  all_genes <- sort(unique(unlist(gene_lists)))
+  mat <- sapply(gene_lists, function(g) all_genes %in% g)
+  
+  presence_df <- data.frame(gene_id = all_genes, mat, check.names = FALSE)
+  presence_df$num_dfs_present <- rowSums(mat)
+  
+  presence_df <- merge(presence_df, gene_id_to_name, 
+                       by.x = "gene_id", by.y = "Gene_ID", all.x = TRUE)
+  
+  presence_filtered <- presence_df %>% 
+    filter(num_dfs_present >= 2) %>% 
+    arrange(desc(num_dfs_present))
+
+  return(list(full = presence_df, filtered = presence_filtered))
+}
+```
+
+# load data
+```{r}
+# limma normalized data for plotting
+counts_norm <- fread("../data/limma_corrected_allSamples.csv", data.table = F)
+weekly_exac <- fread("../data/periCOPD_exac_weekly.csv", data.table = F)
+gene_id_to_name <- read.csv("../data/gene_id_to_name_map.csv")
+gene_name_map <- setNames(gene_id_to_name$Gene_Name, gene_id_to_name$Gene_ID)
+
+weekly_exac <- weekly_exac %>%
+  mutate(week_num = as.integer(str_extract(study_week, "(?<=week_)\\d+"))) %>%
+  mutate(week_num = if_else(is.na(week_num), 0L, week_num))
+
+# removed S1003 week 10 because phenotype data missing
+counts <- merge(counts_norm, weekly_exac %>% dplyr::select(SID, week_num, exacerbation_week_flag), by.x = c("subject_id", "week_num"), by.y = c("SID", "week_num")) %>%
+  relocate(exacerbation_week_flag, .after = week_num) %>%
+  arrange(subject_id, week_num)
+
+counts_1 <- counts %>% 
+  filter(subject_id == "S1001") %>% 
+  mutate(time = c(-11:-1, 0:3, -5:-1, 0:4))
+
+counts_2 <- counts %>% 
+  filter(subject_id == "S1002") %>% 
+  mutate(time = c(-10:-1, 0:3, -8:-1, 0:1))
+
+counts_3 <- counts %>% 
+  filter(subject_id == "S1003") %>% 
+  mutate(time = c(-7:-1, 0:3, -6:-1, 0:6))
+
+counts_4 <- counts %>% 
+  filter(subject_id == "S1004") %>%
+  mutate(time = c(-9:-1, 0:3, -1:9))
+
+all_times <- c(
+  c(-11:-1, 0:3, -5:-1, 0:4),
+  c(-10:-1, 0:3, -8:-1, 0:1),
+  c(-7:-1, 0:3, -6:-1, 0:6),
+  c(-9:-1, 0:3, -1:9)
+)
+# ChanRev02
+sum(all_times == 0)
+```
+
+```{r}
+rnaPath="path/to/rna_seq/"
+# read in data in 3 batches
+batches=c("Batch1","Batch2","Batch3")
+batch=batches[1]
+counts <- read_excel(paste0(rnaPath,batch,"/Raw_Normalized_Counts_Genes_DESeq2_HTSEQ.xlsx"))
+b1L=dim(counts)[2]-3 # 3 identifier columns
+batchLengths=c(1:3)
+batchLengths[1]<-b1L
+for(i in 2:length(batches)){
+  
+  batch=batches[i]
+  counts2 <- read_excel(paste0(rnaPath,batch,"/Raw_Normalized_Counts_Genes_DESeq2_HTSEQ.xlsx"))
+  batchLengths[i]<-dim(counts2)[2]-3
+  
+  counts <- merge(counts,counts2,by=c("Gene_ID","Gene_Name","Gene_Biotype"),all.x=T)
+  
+}
+
+
+counts_filt <- counts[, c(1, 4:ncol(counts))]
+gene_names <- counts_filt[,1] # gene IDs/names
+counts_matrix <- counts_filt[,-1]
+
+colnames(counts_matrix) <- colnames(counts)[4:ncol(counts)]
+rownames(counts_matrix) <- counts$Gene_ID
+
+batch <- rep(1:length(batchLengths), times = batchLengths)
+metadata <- data.frame(
+  sample = colnames(counts_matrix),
+  batch = batch
+)
+
+# ChanRev01
+samples_raw <- metadata$sample[grepl("Raw.Read.Count", metadata$sample)]
+length(samples_raw)
+# "V samples" 
+sum(grepl("V", samples_raw))
+# there are technically 25 weeks * 4 subjects = 100 time points
+# some weeks have two measures one done at home one done in person
+metadata_raw_all <- data.frame(
+  subject_id = sub("-.*", "", samples_raw),
+  timepoint = as.numeric(sub(".*-W(\\d+)V?_.*", "\\1", samples_raw)),
+  full_name = samples_raw) %>%
+  arrange(subject_id, timepoint)
+DT::datatable(metadata_raw_all)
+```
+
+
+```{r eval=FALSE}
+# Remove two samples based on low % alignment, S1003 week 10 missing from pheno
+rmSamples <- c("S1004-W5","S1002-W7","S1003-W10")
+rmSampleNames=grep(paste0(c(rmSamples),collapse = "|"),colnames(counts_matrix),value=T)
+counts_matrix <- counts_matrix[, !colnames(counts_matrix) %in% rmSampleNames]
+
+metadata$subject_id <- sub("-.*", "", metadata$sample)
+
+metadata <- metadata %>%
+  filter(sample %in% colnames(counts_matrix)) %>%
+  dplyr::rename(Sample = sample, Batch = batch, Subject = subject_id) %>%
+  mutate(Condition = "case") %>%
+  mutate(Time = as.numeric(sub(".*-W(\\d+).*", "\\1", Sample))) %>%
+  mutate(Batch = as.factor(Batch))
+
+# if there is a clinic sample for that week, remove the at home sample
+V_samples <- metadata$Sample[grepl("V", metadata$Sample)]
+nonV_to_remove <- sub("V", "", V_samples)
+
+counts_matrix_filtered <- counts_matrix[, !colnames(counts_matrix) %in% nonV_to_remove]
+metadata <- metadata %>% filter(!Sample %in% nonV_to_remove)
+
+counts_raw <- counts_matrix_filtered[, grep("Raw.Read.Count", names(counts_matrix_filtered), value = TRUE)]
+metadata_raw <- metadata[grepl("Raw.Read.Count", metadata$Sample), ]
+table(metadata_raw$Batch, metadata_raw$Subject)
+
+weekly_exac <- fread("../data/periCOPD_exac_weekly.csv", data.table = F)
+
+weekly_exac <- weekly_exac %>%
+  mutate(week_num = as.integer(str_extract(study_week, "(?<=week_)\\d+"))) %>%
+  mutate(week_num = if_else(is.na(week_num), 0L, week_num))
+
+metadata_raw <- merge(metadata_raw, weekly_exac %>% dplyr::select(SID, week_num, exacerbation_week_flag), by.x = c("Subject", "Time"), by.y = c("SID", "week_num")) %>%
+  arrange(Subject, Time)
+
+# this need to be rownames or the plotting won't work
+rownames(metadata_raw) <- metadata_raw$Sample
+
+head(metadata_raw)
+
+# top 50 percent 
+gene_means <- rowMeans(counts_raw)
+threshold <- quantile(gene_means, 0.5)
+top_genes <- names(gene_means[gene_means > threshold])
+counts_raw_top <- counts_raw[top_genes, ]
+```
+
+# S1
+```{r eval=FALSE}
+metadata_1 <- metadata_raw %>%
+  filter(Subject == "S1001")
+
+# allow two weeks after exacerbation week to be counted as positive
+exac_idx_1 <- c(-11:-1, 0:3, -5:-1, 0:4)
+metadata_1$Time <- exac_idx_1
+
+counts_raw_top_1 <- counts_raw_top[, grepl("^S1001", colnames(counts_raw_top))]
+counts_week_num <- as.numeric(sub(".*-W(\\d+).*", "\\1", colnames(counts_raw_top_1)))
+counts_raw_top_1 <- counts_raw_top_1[, colnames(counts_raw_top_1)[order(counts_week_num)]]
+counts_raw_top_mat_1 <- as.matrix(counts_raw_top_1)
+
+objectImpulseDE2_1 <- runImpulseDE2(
+  matCountData = counts_raw_top_1_mat,
+  dfAnnotation = metadata_1,
+  boolCaseCtrl = FALSE,
+  boolIdentifyTransients = TRUE,
+  scaQThres = 0.05 # adjusted p value
+)
+
+save(objectImpulseDE2_1, file = "../data/ImpulseDE2_results_top50perc_1.RData")
+```
+
+```{r}
+load("../data/ImpulseDE2_results_top50perc_1.RData")
+
+# default adjuted pval for isTransient is 0.001, increase to 0.05 to get more transient genes
+objectImpulseDE2_1 <- updateDEAnalysis(objectImpulseDE2=objectImpulseDE2_1, scaQThresTransients=0.05)
+
+ide_out_1 <- objectImpulseDE2_1$dfImpulseDE2Results
+
+ide_out_1 <- merge(ide_out_1, gene_id_to_name, by.x = "Gene", by.y = "Gene_ID", all.x = TRUE) %>% 
+  relocate(Gene_Name, .before = Gene) %>% 
+  dplyr::rename("ensembl_id" = "Gene", "gene_name" = "Gene_Name") %>%
+  arrange(desc(isTransient), p) %>%
+  filter(p < 0.05) %>% # this is for whether the gene is differentially expressed over time 
+  mutate_if(is.numeric, signif, digits = 3) %>% 
+  dplyr::select(-starts_with("converge_"))
+
+model_fits_1 <- get_lsModelFits(objectImpulseDE2_1)[["case"]]
+
+nrow(ide_out_1)
+objectImpulseDE2_1@dfAnnotationProc$Time
+```
+
+## impulse
+```{r}
+ide_out_1_transient <- ide_out_1 %>% 
+  filter(isTransient==TRUE) %>%
+  arrange(impulseTOsigmoid_p)
+
+ide_out_1_transient <- get_impulse_params(ide_out_1_transient, model_fits_1) %>% mutate_if(is.numeric, signif, digits = 3)
+```
+
+### during & narrow
+```{r}
+ide_out_1_transient_0_narr <- ide_out_1_transient %>%
+  filter(peak_time >= -1 & peak_time <= 1) %>%
+  filter(peak_width <= 2)
+
+DT::datatable(ide_out_1_transient_0_narr, rownames=F,options=list(scrollX=T))
+# write.table(ide_out_1_transient_0_narr, "../data/ide_out_1_transient_0_narr.txt", row.names = F, quote = F, sep = "\t")
+```
+
+
+# S2
+```{r eval=FALSE}
+metadata_2 <- metadata_raw %>%
+  filter(Subject == "S1002")
+
+# allow two weeks after exacerbation week to be counted as positive
+exac_idx_2 <- c(-10:-1, 0:3, -8:-1, 0:1)
+metadata_2$Time <- exac_idx_2
+
+counts_raw_top_2 <- counts_raw_top[, grepl("^S1002", colnames(counts_raw_top))]
+counts_week_num <- as.numeric(sub(".*-W(\\d+).*", "\\1", colnames(counts_raw_top_2)))
+counts_raw_top_2 <- counts_raw_top_2[, colnames(counts_raw_top_2)[order(counts_week_num)]]
+counts_raw_top_2_mat <- as.matrix(counts_raw_top_2)
+
+objectImpulseDE2_2 <- runImpulseDE2(
+  matCountData = counts_raw_top_2_mat,
+  dfAnnotation = metadata_2,
+  boolCaseCtrl = FALSE,
+  vecConfounders = c("Batch"), # adjust for batch
+  boolIdentifyTransients = TRUE,
+  scaQThres = 0.05 # adjusted p value
+)
+
+save(objectImpulseDE2_2, file = "../data/ImpulseDE2_results_top50perc_2_adj_batch_recode.RData")
+```
+
+```{r}
+load("../data/ImpulseDE2_results_top50perc_2_adj_batch_recode.RData")
+
+objectImpulseDE2_2 <- updateDEAnalysis(objectImpulseDE2=objectImpulseDE2_2, scaQThresTransients=0.05)
+
+ide_out_2 <- objectImpulseDE2_2$dfImpulseDE2Results
+
+ide_out_2<- merge(ide_out_2, gene_id_to_name, by.x = "Gene", by.y = "Gene_ID", all.x = TRUE) %>% 
+  relocate(Gene_Name, .before = Gene) %>% 
+  dplyr::rename("ensembl_id" = "Gene", "gene_name" = "Gene_Name") %>%
+  arrange(desc(isTransient), p) %>%
+  filter(p < 0.05) %>%
+  mutate_if(is.numeric, signif, digits = 3) %>% 
+  dplyr::select(-starts_with("converge_"))
+
+model_fits_2 <- get_lsModelFits(objectImpulseDE2_2)[["case"]]
+
+nrow(ide_out_2)
+objectImpulseDE2_2@dfAnnotationProc$Time
+```
+
+## impulse
+```{r}
+ide_out_2_transient <- ide_out_2 %>% 
+  filter(isTransient==TRUE) %>%
+  arrange(impulseTOsigmoid_p)
+
+ide_out_2_transient <- get_impulse_params(ide_out_2_transient, model_fits_2) %>% mutate_if(is.numeric, signif, digits = 3)
+```
+
+### during & narrow
+```{r}
+ide_out_2_transient_0_narr <- ide_out_2_transient %>%
+  filter(peak_time >= -1 & peak_time <= 1) %>%
+  filter(peak_width <= 2)
+
+DT::datatable(ide_out_2_transient_0_narr, rownames=F,options=list(scrollX=T))
+# write.table(ide_out_2_transient_0_narr, "../data/ide_out_2_transient_0_narr.txt", row.names = F, quote = F, sep = "\t")
+```
+
+# S3
+```{r eval=FALSE}
+metadata_3 <- metadata_raw %>%
+  filter(Subject == "S1003")
+
+# allow two weeks after exacerbation week to be counted as positive
+exac_idx_3 <- c(-7:-1, 0:3, -6:-1, 0:6)
+metadata_3$Time <- exac_idx_3
+
+counts_raw_top_3 <- counts_raw_top[, grepl("^S1003", colnames(counts_raw_top))]
+counts_week_num <- as.numeric(sub(".*-W(\\d+).*", "\\1", colnames(counts_raw_top_3)))
+counts_raw_top_3 <- counts_raw_top_3[, colnames(counts_raw_top_3)[order(counts_week_num)]]
+counts_raw_top_3_mat <- as.matrix(counts_raw_top_3)
+
+objectImpulseDE2_3 <- runImpulseDE2(
+  matCountData = counts_raw_top_3_mat,
+  dfAnnotation = metadata_3,
+  boolCaseCtrl = FALSE,
+  boolVerbose = TRUE,
+  vecConfounders = c("Batch"), # adjust for batch
+  boolIdentifyTransients = TRUE,
+  scaQThres = 0.05 # adjusted p value
+)
+
+save(objectImpulseDE2_3, file = "../data/ImpulseDE2_results_top50perc_3_adj_batch.RData")
+```
+
+```{r}
+load("../data/ImpulseDE2_results_top50perc_3_adj_batch.RData")
+
+# default adjuted pval for isTransient is 0.001, increase to 0.05 to get more transient genes
+objectImpulseDE2_3 <- updateDEAnalysis(objectImpulseDE2=objectImpulseDE2_3, scaQThresTransients=0.05)
+
+ide_out_3 <- objectImpulseDE2_3$dfImpulseDE2Results
+
+ide_out_3 <- merge(ide_out_3, gene_id_to_name, by.x = "Gene", by.y = "Gene_ID", all.x = TRUE) %>% 
+  relocate(Gene_Name, .before = Gene) %>% 
+  dplyr::rename("ensembl_id" = "Gene", "gene_name" = "Gene_Name") %>%
+  arrange(desc(isTransient), p) %>%
+  filter(p < 0.05) %>%
+  mutate_if(is.numeric, signif, digits = 3) %>% 
+  dplyr::select(-starts_with("converge_"))
+
+model_fits_3 <- get_lsModelFits(objectImpulseDE2_3)[["case"]]
+
+nrow(ide_out_3)
+objectImpulseDE2_3@dfAnnotationProc$Time
+```
+
+## impulse
+```{r}
+ide_out_3_transient <- ide_out_3 %>% 
+  filter(isTransient==TRUE) %>%
+  arrange(impulseTOsigmoid_p)
+
+ide_out_3_transient <- get_impulse_params(ide_out_3_transient, model_fits_3) %>% mutate_if(is.numeric, signif, digits = 3)
+```
+
+### during & narrow
+```{r}
+ide_out_3_transient_0_narr <- ide_out_3_transient %>%
+  filter(peak_time >= -1 & peak_time <= 1) %>%
+  filter(peak_width <= 2)
+
+DT::datatable(ide_out_3_transient_0_narr, rownames=F,options=list(scrollX=T))
+# write.table(ide_out_3_transient_0_narr, "../data/ide_out_3_transient_0_narr.txt", row.names = F, quote = F, sep = "\t")
+```
+
+
+# S4
+```{r eval=FALSE}
+metadata_4 <- metadata_raw %>%
+  filter(Subject == "S1004")
+
+# allow two weeks after exacerbation week to be counted as positive
+exac_idx_4 <- c(-9:-1, 0:3, -1:3, -6:-1)
+metadata_4$Time <- exac_idx_4
+
+counts_raw_top_4 <- counts_raw_top[, grepl("^S1004", colnames(counts_raw_top))]
+counts_week_num <- as.numeric(sub(".*-W(\\d+).*", "\\1", colnames(counts_raw_top_4)))
+counts_raw_top_4 <- counts_raw_top_4[, colnames(counts_raw_top_4)[order(counts_week_num)]]
+counts_raw_top_4_mat <- as.matrix(counts_raw_top_4)
+
+objectImpulseDE2_4 <- runImpulseDE2(
+  matCountData = counts_raw_top_4_mat,
+  dfAnnotation = metadata_4,
+  boolCaseCtrl = FALSE,
+  boolIdentifyTransients = TRUE,
+  scaQThres = 0.05 # adjusted p value
+)
+
+save(objectImpulseDE2_4, file = "../data/ImpulseDE2_results_top50perc_4_2peaks.RData")
+```
+
+```{r}
+load("../data/ImpulseDE2_results_top50perc_4_2peaks.RData")
+
+# default adjuted pval for isTransient is 0.001, increase to 0.05 to get more transient genes
+objectImpulseDE2_4 <- updateDEAnalysis(objectImpulseDE2=objectImpulseDE2_4, scaQThresTransients=0.05)
+
+ide_out_4 <- objectImpulseDE2_4$dfImpulseDE2Results
+
+ide_out_4 <- merge(ide_out_4, gene_id_to_name, by.x = "Gene", by.y = "Gene_ID", all.x = TRUE) %>% 
+  relocate(Gene_Name, .before = Gene) %>% 
+  dplyr::rename("ensembl_id" = "Gene", "gene_name" = "Gene_Name") %>%
+  arrange(desc(isTransient), p) %>%
+  filter(p < 0.05) %>%
+  mutate_if(is.numeric, signif, digits = 3) %>% 
+  dplyr::select(-starts_with("converge_"))
+
+model_fits_4 <- get_lsModelFits(objectImpulseDE2_4)[["case"]]
+
+nrow(ide_out_4)
+objectImpulseDE2_4@dfAnnotationProc$Time
+```
+
+## impulse
+```{r}
+ide_out_4_transient <- ide_out_4 %>% 
+  filter(isTransient==TRUE) %>%
+  arrange(impulseTOsigmoid_p)
+
+ide_out_4_transient <- get_impulse_params(ide_out_4_transient, model_fits_4) %>% mutate_if(is.numeric, signif, digits = 3)
+```
+
+### during & narrow
+```{r}
+ide_out_4_transient_0_narr <- ide_out_4_transient %>%
+  filter(peak_time >= -1 & peak_time <= 1) %>%
+  filter(peak_width <= 2)
+
+DT::datatable(ide_out_4_transient_0_narr, rownames=F,options=list(scrollX=T))
+# write.table(ide_out_4_transient_0_narr, "../data/ide_out_4_transient_0_narr.txt", row.names = F, quote = F, sep = "\t")
+```
+
+# overlaps impulse
+```{r}
+SumTab_transient_0_narr <- get_gene_overlap(
+  ide_out_1_transient_0_narr,
+  ide_out_2_transient_0_narr,
+  ide_out_3_transient_0_narr,
+  ide_out_4_transient_0_narr,
+  gene_id_to_name)
+
+
+# ChanRev03
+print(nrow(SumTab_transient_0_narr$filtered))
+# ChanRev04
+print(nrow(SumTab_transient_0_narr$full))
+DT::datatable(SumTab_transient_0_narr$full %>% arrange(desc(num_dfs_present), gene_id))
+```
+
+```{r eval=FALSE}
+write.csv(SumTab_transient_0_narr$filtered, "../data/impulseDE_top50perc_transient_centered0_genes_norm_overlap_count.csv", row.names = F, quote = F)
+
+write.csv(SumTab_transient_0_narr$full, "../data/impulseDE_top50perc_transient_centered0_genes_norm_overlap_count_all.csv", row.names = F, quote = F)
+```
+
+# venn diagram
+```{r fig.height=6, fig.width=6}
+# ChanRev05 
+library(VennDiagram)
+
+SumTab_transient_0_narr_full <- read.csv("../data/impulseDE_top50perc_transient_centered0_genes_norm_overlap_count_all.csv", header=T)
+
+venn_list <- list(
+  `Subject 1` = SumTab_transient_0_narr_full$gene_id[SumTab_transient_0_narr_full$df1],
+  `Subject 4` = SumTab_transient_0_narr_full$gene_id[SumTab_transient_0_narr_full$df4],
+  `Subject 2` = SumTab_transient_0_narr_full$gene_id[SumTab_transient_0_narr_full$df2],
+  `Subject 3` = SumTab_transient_0_narr_full$gene_id[SumTab_transient_0_narr_full$df3]
+)
+
+venn <- venn.diagram(
+  x = venn_list,
+  filename = NULL,
+  fill = c("#66c2a5", "#fc8d62", "#8da0cb", "#e78ac3"),
+  alpha = 0.4,
+  col = "grey30",
+  lwd = 1,
+  cex = 1.5,
+  cat.cex = 1.5,
+  cat.pos = c(340,20,0,0),
+  margin = 0.05
+)
+print(venn)
+ggsave(venn, file="../figures_final/impulse_overlap_venn.png", width = 6, height = 6, device = "png")
+
+cairo_ps("../figures_final/impulse_overlap_venn.eps", width = 6, height = 6, family = "sans")
+grid::grid.draw(venn)
+dev.off()
+```
+
+# WGCNA AMEND
+```{r}
+# code for running WGCNA and AMEND in WGCNA_AMEND.R
+
+load("../data/impulse_short_in_module_adj0.95_n20.RData")
+names(amend_results)
+```
+
+```{r}
+short_in_blue <- amend_results$blue
+# ChanRev08
+cat("number of nodes:", vcount(short_in_blue$module), "\n")
+cat("number of edges:", ecount(short_in_blue$module), "\n")
+# ChanRev09
+cat("number of seed genes:",sum(V(short_in_blue$module)$seeds), "\n")
+```
+
+```{r}
+connector_nodes <- sub("\\|layer1", "", V(short_in_blue$module)[seeds == 0]$name)
+connector_nodes_name <- gene_id_to_name %>%
+  filter(Gene_ID %in% connector_nodes) %>%
+  pull(Gene_Name)
+
+connector_nodes_name
+# added by WGCNA and random walk
+```
+
+```{r}
+graph <- short_in_blue$module
+
+edges <- as_data_frame(graph, what = "edges")
+edges$from <- sub("\\|layer1", "", edges$from)
+edges$to   <- sub("\\|layer1", "", edges$to)
+
+edges <- merge(edges, gene_id_to_name, by.x = "from", by.y = "Gene_ID", all.x = TRUE) %>%
+  rename(from_gene = Gene_Name)
+edges <- merge(edges, gene_id_to_name, by.x = "to", by.y = "Gene_ID", all.x = TRUE) %>%
+  rename(to_gene = Gene_Name)
+# ChanRev10, plotted in cytoscape
+DT::datatable(edges, rownames = F)
+# write.table(edges, file = "../data/WGCNA_AMEND_networks/short_in_blue_adj0.95_n20_fin.txt", sep = "\t", row.names = FALSE, col.names = TRUE, quote = FALSE)
+
+nodes_df <- data.frame(ENSG_ID = sub("\\|layer1", "", V(graph)$name), is_seed = V(graph)$seeds)
+nodes_df <- merge(nodes_df, gene_id_to_name, by.x = "ENSG_ID", by.y = "Gene_ID", all.x = TRUE)
+# write.table(nodes_df, file = "../data/WGCNA_AMEND_networks/short_in_blue_nodes_adj0.95_n20_fin.txt", sep = "\t", row.names = FALSE, col.names = TRUE, quote = FALSE)
+```
+
+
+## heatmap module genes
+```{r fig.height=6, fig.width=6}
+short_in_blue <- read.table(file = "../data/WGCNA_AMEND_networks/short_in_blue_nodes_adj0.95_n20_fin.txt", sep = "\t", header=TRUE)
+module_genes <- short_in_blue$ENSG_ID
+
+heatmap_mat <- bind_rows(counts_1, counts_2, counts_3, counts_4) %>%
+  select(all_of(c("subject_id", "week_num", "time")), all_of(module_genes)) %>%
+  pivot_longer(cols = all_of(module_genes), 
+               names_to = "gene", values_to = "expression") %>%
+  group_by(subject_id, gene) %>%
+  mutate(zscore = scale(expression)) %>%  # z-score within each subject
+  ungroup() %>%
+  group_by(gene, time) %>%
+  summarize(zscore = mean(zscore, na.rm = TRUE), .groups = "drop") %>%  # average across subjects
+  pivot_wider(names_from = time, values_from = zscore) %>%
+  column_to_rownames("gene") %>%
+  as.matrix()
+
+rownames(heatmap_mat) <- gene_name_map[rownames(heatmap_mat)]
+
+max_abs <- max(abs(heatmap_mat), na.rm = TRUE)
+my_breaks <- seq(-max_abs, max_abs, length.out = 101)
+my_colors <- colorRampPalette(c("darkgreen", "white", "red3"))(100)
+
+heatmap <- pheatmap::pheatmap(heatmap_mat,
+         cluster_rows = TRUE,
+         cluster_cols = FALSE,
+         scale = "none",
+         color = my_colors,
+         breaks = my_breaks,
+         fontsize_row = 8, fontsize_col = 8,
+         angle_col = 0)
+
+# ChanRev07
+heatmap
+# ggsave("figures/heatmap_all_subjects_WGCNA_module.jpg", heatmap, dpi = 600, width = 6, height = 6)
+```
+
+## individual heatmap module genes
+```{r}
+plot_indiv_heatmap <- function(counts_df, sid) {
+
+  df_sid_long <- counts_df %>%
+    select(week_num, all_of(module_genes)) %>%
+    pivot_longer(cols = all_of(module_genes),
+                 names_to = "gene",
+                 values_to = "expression")
+  
+  df_sid_z <- df_sid_long %>%
+    group_by(gene) %>%
+    mutate(zscore = as.numeric(scale(expression))) %>%   # z score across weeks
+    ungroup()
+  
+  heatmap_mat <- df_sid_z %>%
+    select(gene, week_num, zscore) %>%
+    tidyr::complete(gene, week_num = 1:7) %>% # fill weeks with NA (except week 10 of subj 3 where pheno is missing)
+    pivot_wider(names_from = week_num, values_from = zscore) %>%
+    column_to_rownames("gene") %>%
+    as.matrix()
+  
+  heatmap_mat <- heatmap_mat[, order(as.numeric(colnames(heatmap_mat))), drop = FALSE]
+  rownames(heatmap_mat) <- gene_name_map[rownames(heatmap_mat)]
+
+  max_abs <- max(abs(heatmap_mat), na.rm = TRUE)
+  my_breaks <- seq(-max_abs, max_abs, length.out = 101)
+  my_colors <- colorRampPalette(c("darkgreen", "white", "red3"))(100)
+  legend_vals <- round(my_breaks[c(1, length(my_breaks) %/% 2, length(my_breaks))], 2)
+  legend_vals <- c(ceiling(-max_abs),  0, floor(max_abs))
+  pheatmap::pheatmap(
+    heatmap_mat,
+    cluster_rows = FALSE,
+    cluster_cols = FALSE,
+    color = my_colors,
+    breaks = my_breaks,
+    border_color = NA,
+    fontsize_col = 10,
+    fontsize_number = 10,
+    angle_col = 0,
+    show_rownames = FALSE,
+    legend_labels = legend_vals
+    # main = paste0("Subject: ", sid, " gene z-score across weeks")
+  )
+}
+```
+
+```{r fig.height=1, fig.width=10}
+# ChanRev11
+p1 <- plot_indiv_heatmap(counts_1, "S1001")
+print(p1)
+# ggsave("figures/heatmap_module_S1001.png", p1$gtable, height = 1, width = 10, dpi = 600)
+```
+
+```{r fig.height=1, fig.width=10}
+# ChanRev11
+p2 <- plot_indiv_heatmap(counts_2, "S1002")
+print(p2)
+# ggsave("figures/heatmap_module_S1002.png", p2$gtable, height = 1, width = 10, dpi = 600)
+```
+
+```{r fig.height=1, fig.width=10}
+# ChanRev11
+p3 <- plot_indiv_heatmap(counts_3, "S1003")
+print(p3)
+# ggsave("figures/heatmap_module_S1003.png", p3$gtable, height = 1, width = 10, dpi = 600)
+```
+
+```{r fig.height=1, fig.width=10}
+# ChanRev11
+p4 <- plot_indiv_heatmap(counts_4, "S1004")
+print(p4)
+# ggsave("figures/heatmap_module_S1004.png", p4$gtable, height = 1, width = 10, dpi = 600)
+```
+
+
+# pathway analysis
+```{r}
+library(sigora)
+library(dplyr)
+library(ggplot2)
+options(bitmapType='cairo')
+```
+
+```{r}
+# all 248
+SumTab_transient_0_narr_full <- read.csv("../data/impulseDE_top50perc_transient_centered0_genes_norm_overlap_count_all.csv")
+DT::datatable(SumTab_transient_0_narr_full, options = list(scrollX=TRUE))
+```
+
+```{r}
+sigora_long_list <- sigora(queryList = SumTab_transient_0_narr_full$gene_id, GPSrepo = load_data("reaH"), level = 4)
+
+sigora_long_list_sumtab <- sigora_long_list$summary_results %>%
+  dplyr::select(-Bonferroni) %>%
+  mutate(FDR.pvalues=p.adjust(pvalues,method = "BH")) %>%
+  filter(FDR.pvalues < 0.05) %>%
+  relocate(FDR.pvalues, .after="pvalues")
+write.table(sigora_long_list_sumtab, "../data/pathway_analysis_reactome_248_all_impulse_genes.txt", sep = "\t", row.names = F, quote = F)
+
+DT::datatable(sigora_long_list_sumtab, options = list(scrollX=TRUE))
+```
+
+```{r fig.height=5, fig.width=8}
+sigora_long_list_sumtab <- sigora_long_list_sumtab %>%
+  mutate(logFDR = -log10(FDR.pvalues))
+# ChanRev06
+p <- ggplot(sigora_long_list_sumtab, aes(x = logFDR,
+                    y = reorder(description, logFDR))) +
+  geom_col(fill = "#336699") +
+  labs(x = "-log10(FDR)", y = NULL) +
+  theme_bw() +
+  theme(axis.text.y = element_text(size = 10)) 
+print(p)
+
+ggsave("../figures/all_impulse_genes_sigora_reactome_pathway.png", width = 8, height = 5, dpi = 600)
+```
+
+
+```{r}
+subj3_genes <- SumTab_transient_0_narr_full %>% filter(df3 == T)
+sigora_s3_list <- sigora(queryList = subj3_genes$gene_id, GPSrepo = load_data("reaH"), level = 4)
+
+sigora_s3_list_sumtab <- sigora_s3_list$summary_results
+#   dplyr::select(-Bonferroni) %>%
+#   mutate(FDR.pvalues=p.adjust(pvalues,method = "BH")) %>%
+#   filter(FDR.pvalues < 0.05) %>%
+#   relocate(FDR.pvalues, .after="pvalues")
+# write.table(sigora_s3_list_sumtab, "../data/pathway_analysis_reactome_subject3_impulse_genes.txt", sep = "\t", row.names = F, quote = F)
+
+DT::datatable(sigora_s3_list_sumtab, options = list(scrollX=TRUE))
+```
+
+```{r}
+sessionInfo()
+```
+

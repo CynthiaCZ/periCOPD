@@ -1,0 +1,897 @@
+---
+title: "Test COPDGene weighted NERD score in eclipse"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r}
+library(stringr)
+library(dplyr)
+library(data.table)
+library(caret)
+library(pROC)
+library(tableone)
+library(survival)
+library(survminer)
+library(coin)
+
+options(bitmapType="cairo")
+```
+
+# functions
+```{r}
+call_model <- function(df, outcome_name, top_genes, covars, adjustment=NULL, model_type) {
+  results <- data.frame(gene = character(), beta = numeric(), ci_lower = numeric(), ci_upper = numeric(), beta_ci = character(), pval = numeric(), stringsAsFactors = FALSE)
+
+  for (gene in top_genes) {
+    gene <- ifelse(grepl("\\|", gene), paste0("`", gene, "`"), gene)
+
+    formula_components <- c(gene, covars, adjustment)
+    formula_str <- paste0(outcome_name, " ~ ", paste0(formula_components, collapse = " + "))
+    
+    tryCatch({
+      if (model_type == "nb") {
+        model <- glm.nb(as.formula(formula_str), data = df)
+      } else if (model_type == "binomial") {
+        model <- glm(as.formula(formula_str), data = df, family = binomial())
+      }
+        else if (model_type == "lm") {
+        model <- lm(as.formula(formula_str), data = df)
+      }
+  
+
+    beta <- coef(model)[gene]
+    ci <- confint(model, gene, level = 0.95)
+    beta_ci <- sprintf("%.3f (%.3f, %.3f)", beta, ci[1], ci[2])
+    pval <- summary(model)$coefficients[gene, 4]
+    results <- rbind(results, data.frame(gene = gene, beta = beta, ci_lower = ci[1], ci_upper = ci[2], beta_ci = beta_ci, pval = pval))
+    }, error = function(e) {
+      message(sprintf("Skipping gene %s due to error: %s", gene, e$message))
+    })
+  }
+  return(results)
+}
+```
+
+```{r}
+get_ntile_summary <- function(df, outcome_name, score, covars, adjustment=NULL, model_type=NULL, ntile) {
+  # create ntile column for score
+  df <- df %>%
+    mutate(score_ntile = ntile(.data[[score]], ntile))
+ 
+  ntile_results <- data.frame(ntile = numeric(),
+                             OR = numeric(),
+                             OR_CI_lower = numeric(),
+                             OR_CI_upper = numeric(), 
+                             beta = numeric(),
+                             beta_ci_lower = numeric(),
+                             beta_ci_upper = numeric(),
+                             P = numeric(),
+                             N = numeric(),
+                             Mean = numeric(),
+                             Sd = numeric())
+                              
+  for (cur_ntile in 1:ntile) {
+    df$cur_ntile <- ifelse(df$score_ntile == 1, 0, ifelse(df$score_ntile == cur_ntile, 1, NA))
+    if (cur_ntile == 1) {
+      ntile_results <- rbind(ntile_results,
+                                data.frame(ntile = cur_ntile,
+                                           OR = 1,
+                                           CI_lower = NA,
+                                           CI_upper = NA,
+                                           beta = 0,
+                                           beta_ci_lower = NA,
+                                           beta_ci_upper = NA,
+                                           P = NA,
+                                           N = sum(df$score_ntile == 1, na.rm = TRUE),
+                                           Mean = mean(df[df$score_ntile == 1, score], na.rm = TRUE),
+                                           Sd = sd(df[df$score_ntile == 1, score], na.rm = TRUE)))
+    } else {
+      model_table <- call_model(df[!is.na(df$cur_ntile), ], outcome_name, top_genes = "cur_ntile", covars = covars, adjustment = adjustment, model_type = model_type)
+
+      ntile_results <- rbind(ntile_results,
+                                data.frame(ntile = cur_ntile,
+                                           OR = exp(model_table$beta),
+                                           CI_lower = exp(model_table$ci_lower),
+                                           CI_upper = exp(model_table$ci_upper),
+                                           beta = model_table$beta,
+                                           beta_ci_lower = model_table$ci_lower,
+                                           beta_ci_upper = model_table$ci_upper,
+                                           P = model_table$pval,
+                                           N = sum(df$cur_ntile == 1, na.rm = TRUE),
+                                           Mean = mean(df[df$cur_ntile == 1, score], na.rm = TRUE),
+                                           Sd = sd(df[df$cur_ntile == 1, score], na.rm = TRUE)))
+    }
+  }
+  
+  return(ntile_results)
+}
+
+```
+
+```{r}
+
+call_coxph <- function(df, time, event, predictor, adjustment_vars) {
+  
+  surv_obj <- Surv(time = df[[time]], event = df[[event]])
+  
+  formula_components <- c(predictor, adjustment_vars)
+  formula <- as.formula(paste0("surv_obj ~ ", paste(formula_components, collapse = " + ")))
+  
+  model <- coxph(formula, data = df)
+  
+  ph_test <- cox.zph(model)
+
+  pred <- predict(model, type = "risk")
+  c_stat <- summary(model)$concordance["C"]
+  c_stat_se <- summary(model)$concordance["se(C)"]
+
+  summ <- summary(model)$coefficients
+  cis <- confint(model)
+  
+  beta <- summ[predictor, "coef"]
+  se <- summ[predictor, "se(coef)"]
+  pval <- summ[predictor, "Pr(>|z|)"]
+  ci <- cis[predictor, ]
+    
+  hr <- exp(beta)
+  hr_ci <- sprintf("%.3f (%.3f, %.3f)", hr, exp(ci[1]), exp(ci[2]))
+    
+  ph_pval <- if (predictor %in% rownames(ph_test$table)) ph_test$table[predictor, "p"] else NA
+    
+  result_df <- data.frame(predictor = predictor, hr = hr, 
+             ci_lower = exp(ci[1]), ci_upper = exp(ci[2]), 
+             hr_ci = hr_ci, se = se, pval = pval, n_samples = model$n, 
+             n_events = summary(model)$nevent,
+             ph_pval = ph_pval, c_stat = c_stat, c_stat_se = c_stat_se)
+
+  return(list(result=result_df, ph_test=ph_test, model=model))
+}
+```
+
+# load data
+```{r}
+load("path/to/microarray_data.Rdata")
+```
+
+```{r}
+eclipse_pheno <- fread("path/to/pheno_data.txt",data.table=F)
+cat("in ECLIPSE pheno: ", nrow(eclipse_pheno), "\n")
+
+# all other outcomes
+load("path/to/outcome_data.rda")
+eclipse_pheno <- merge(eclipse_pheno, ECcomp, by.x="IID", by.y="sid")
+
+exac=fread("path/to/exacerbation_data.csv",data.table=F,select=c("GLOBALID","total_exacerbations"))
+colnames(exac) <- c("IID", "total_exacerbations")
+eclipse_pheno <- merge(eclipse_pheno, exac, by="IID", all.x = TRUE)
+
+eclipse_pheno$total_exacerbations[is.na(eclipse_pheno$total_exacerbations)] <- 0
+summary(eclipse_pheno$total_exacerbations, useNA = "ifany")
+
+sapply(eclipse_pheno[c("ATS_PackYears", "Exacerbation_Frequency", "days_followed")], function(x) sum(is.na(x)))
+eclipse_pheno <- eclipse_pheno[complete.cases(eclipse_pheno[, c("ATS_PackYears", "Exacerbation_Frequency", "days_followed")]), ]
+cat("remove missingness in covars: ", nrow(eclipse_pheno), "\n")
+
+eclipse_pheno$copd <- eclipse_pheno$caCoStatus - 1
+eclipse_pheno <- eclipse_pheno %>% 
+  filter(copd == 1)
+
+# ChanRev14 
+cat("COPD cases ", nrow(eclipse_pheno), "\n")
+
+eclipse_pheno <- eclipse_pheno %>% mutate(
+    has_exacerbation = if_else(total_exacerbations >= 1, 1, 0),
+    freq_exacerbation = if_else(total_exacerbations >= 2, 1, 0),
+    exacerbation_rate = total_exacerbations / days_followed * 365,
+    has_prior_exac = if_else(Exacerbation_Frequency > 0, 1, 0)
+  )
+```
+
+```{r}
+lfu <- read.table("path/to/followup_data.tsv", header = TRUE, sep = "\t")
+ec_id_map <- read.table("path/to/idmap.txt", header = TRUE, sep = "\t")
+ec_id_map <- ec_id_map %>% select(ECLIPSEID, GLOBALID) %>%
+  mutate(GLOBALID = paste0("EC", GLOBALID))
+
+table(lfu$EBSEV, useNA = "ifany")
+# all have exacerbation
+
+surv_df <- lfu %>%
+  filter(EBSEV %in% c("Moderate", "Severe")) %>%
+  group_by(SUBJID) %>%
+  summarise(time_to_first_exac = min(EBONDAY)) %>%
+  merge(ec_id_map, by.x = "SUBJID", by.y = "ECLIPSEID")
+```
+
+# NERD score
+```{r}
+module_weights_df <- read.csv("../data/impulse_gene_score_WGCNA_AMEND_adalasso_subj_fold_selected.txt", sep = "\t")
+DT::datatable(module_weights_df)
+```
+
+```{r}
+module_weights_df$Gene_Name %in% rownames(exprMat2)
+module_weights_df$Gene_Name %in% rownames(exprMat)
+```
+
+```{r eval=FALSE}
+EC_map <- AnnotationDbi::select(
+  hugene10sttranscriptcluster.db,
+  keys = rownames(exprMat),
+  columns = c("ENTREZID", "ENSEMBL"),
+  keytype = "SYMBOL"
+)
+write.table(EC_map, "../data/eclipse_microarray_gene_map.txt", row.names = F, quote = F, sep = "\t")
+```
+
+```{r}
+EC_map <- read.table("../data/eclipse_microarray_gene_map.txt", header = T, sep = "\t")
+# RP5-1024N4.4 is missing
+rownames(exprMat2)[grepl("RP5", rownames(exprMat2))]
+module_weights_df$Gene_ID[!module_weights_df$Gene_ID %in% EC_map$ENSEMBL]
+```
+
+```{r}
+common_genes <- intersect(
+  module_weights_df$Gene_Name,
+  rownames(exprMat2)
+)
+
+expr_sub <- exprMat2[common_genes, , drop = FALSE]
+
+weight_vec <- module_weights_df %>%
+  filter(Gene_Name %in% common_genes) %>%
+  arrange(match(Gene_Name, common_genes)) %>%
+  pull(COPDGene_reweighted)
+
+expr_sub_t <- as.data.frame(t(expr_sub))
+expr_sub_t$IID <- rownames(expr_sub_t)
+df <- merge(eclipse_pheno, expr_sub_t, by = "IID")
+# ChanRev14 
+cat("has microarray data: ", nrow(df), "\n")
+
+# weights with age sex regressed out
+formula_table <- read.table("../data/impulse_gene_score_WGCNA_AMEND_adalasso_subj_fold_selected_w_age_sex.txt", header = T, sep = "\t")
+
+age_w <- formula_table$COPDGene_reweighted[formula_table$Predictor == "age"]
+sex_w <- formula_table$COPDGene_reweighted[formula_table$Predictor == "sex"]
+intercept_w <- formula_table$COPDGene_reweighted[formula_table$Predictor == "intercept"]
+
+scores <- as.vector(as.matrix(df[, common_genes]) %*% weight_vec) +
+  age_w * df$age +
+  sex_w * df$gender +
+  intercept_w
+
+q4_cutoff <- quantile(scores, 0.75, na.rm = TRUE)
+summary(scores)
+sd(scores)
+cat("Q4 nerd score cutoff before scaling:", q4_cutoff)
+
+df$nerd_score <- scale(scores)
+```
+
+```{r}
+surv_df$lfu_has_exac <- 1
+df <- df %>% merge(surv_df, by.x = "IID", by.y = "GLOBALID", all.x = T) %>%
+  mutate(lfu_has_exac = ifelse(is.na(lfu_has_exac), 0, lfu_has_exac)) %>% # if not in lfu, assume no exacerbation
+  mutate(time_to_first_exac = ifelse(is.na(time_to_first_exac), days_followed, time_to_first_exac)) # if no exacerbation, time is the follow up time
+table(df$lfu_has_exac, df$has_exacerbation)
+sum(df$days_followed < df$time_to_first_exac, na.rm = T)
+
+x <- df %>% select(lfu_has_exac, has_exacerbation, days_followed, time_to_first_exac)
+
+# count them as no exac if time to exac is greater than days followed
+df <- df %>%mutate(
+    lfu_has_exac = ifelse(days_followed < time_to_first_exac, 0, lfu_has_exac),
+    days_followed = ifelse(days_followed < time_to_first_exac, time_to_first_exac, days_followed))
+```
+
+```{r}
+de_novo_score <- read.table("../data/cgRNAseq_all_genes_new_scores.txt", header = TRUE, sep = "\t")
+nrow(de_novo_score)
+
+common_map <- EC_map %>%
+  filter(ENSEMBL %in% de_novo_score$ENSG) %>%
+  distinct(ENSEMBL, .keep_all = T)
+nrow(common_map)
+# only 61 out of 298 mapped if use all cg genes
+```
+
+
+## table one
+```{r}
+# ChanRev15
+allVars <- c("age", "gender", "race", "SmokCigNow", "ATS_PackYears", "FEV1pp_utah", "FEV1_FVC_utah", "has_prior_exac", "Exacerbation_Frequency", "days_followed", "has_exacerbation", "exacerbation_rate", "copd")
+catVars <- c("gender", "race", "SmokCigNow", "has_prior_exac", "has_exacerbation", "copd")
+table1 <- CreateTableOne(data = df, vars = allVars, factorVars = catVars)
+table1_output <- print(table1, showAllLevels = TRUE, nonnormal = c("days_followed", "FEV1pp_utah"))
+
+table1_ec <- data.frame(Variable = rownames(table1_output), table1_output, row.names = NULL)
+colnames(table1_ec) <- c("Variable", "level", "ECLIPSE")
+
+DT::datatable(table1_ec, rownames=F)
+write.table(table1_ec, "../data/table1_eclipse.txt", sep = "\t", row.names = TRUE, quote = FALSE)
+```
+
+## multivariable
+```{r}
+sapply(df[c("Exacerbation_Frequency", "ATS_PackYears", "SmokCigNow", "days_followed")], function(x) sum(is.na(x)))
+# no missingess
+```
+
+```{r}
+# score, pack years, prior exacerbation, smk status
+formula_components <- c("nerd_score", "Exacerbation_Frequency", "ATS_PackYears", "SmokCigNow", "offset(log(days_followed/365))")
+formula_str <- paste0("has_exacerbation ~ ", paste0(formula_components, collapse = " + "))
+model_nerd_exac_py_smk <- glm(as.formula(formula_str), data = df, family = binomial())
+
+beta_all <- coef(model_nerd_exac_py_smk)
+ci_all <- confint(model_nerd_exac_py_smk, level = 0.95)
+pval_all <- summary(model_nerd_exac_py_smk)$coefficients[, 4]
+
+nerd_exac_py_smk_table <- data.frame(
+  predictor = names(beta_all),
+  beta = beta_all,
+  ci_lower = ci_all[, 1],
+  ci_upper = ci_all[, 2],
+  pval = pval_all,
+  row.names = NULL) %>%
+  mutate(or = exp(beta), ci_lower = exp(ci_lower), ci_upper = exp(ci_upper), or_ci = sprintf("%.2f (%.2f, %.2f)", or, ci_lower, ci_upper)) %>%
+  mutate(pval = ifelse(pval < 0.001, "<.001",
+                ifelse(pval < 0.01, sub("^0", "", sprintf("%.3f", pval)),
+                                    sub("^0", "", sprintf("%.2f", pval))))) %>%
+  filter(!predictor %in% c("(Intercept)")) %>%
+  mutate(predictor = c("NERD score", "Prior exacerbation", "Pack years", "Current smoking")) %>%
+  dplyr::select(predictor, or_ci, pval)
+
+write.table(nerd_exac_py_smk_table, "../data/multivariable_model_sumtab_eclipse_adj_smk_status.txt", row.names = F, quote = F, sep = "\t")
+# ChanRev21
+DT::datatable(nerd_exac_py_smk_table)
+```
+
+## AUC
+```{r message=FALSE, warning=FALSE}
+# nerd only
+model_nerd <- glm(has_exacerbation ~ nerd_score + offset(log(days_followed/365)), 
+                          data = df, family = binomial())
+df$pred_prob_nerd <- predict(model_nerd, type = "response")
+roc_nerd <- roc(response  = df$has_exacerbation, predictor = df$pred_prob_nerd)
+
+# prior exac only
+model_exac <- glm(has_exacerbation ~ Exacerbation_Frequency + offset(log(days_followed/365)), 
+                       data = df, family = binomial())
+df$pred_prob_exac <- predict(model_exac, type = "response")
+roc_exac <- roc(response  = df$has_exacerbation, predictor = df$pred_prob_exac)
+
+# prior exac and nerd score
+model_nerd_exac <- glm(has_exacerbation ~ Exacerbation_Frequency + nerd_score + offset(log(days_followed/365)), 
+                          data = df, family = binomial())
+df$pred_prob_nerd_exac <- predict(model_nerd_exac, type = "response")
+roc_nerd_exac <- roc(response  = df$has_exacerbation, predictor = df$pred_prob_nerd_exac)
+```
+
+```{r}
+models <- c("NERD score", "Prior Exacerbations",  "Prior Exacerbations + NERD")
+rocs <- list(roc_nerd, roc_exac, roc_nerd_exac)
+
+auc_df <- data.frame(model = models, auc = sapply(rocs, auc))
+
+ci_mat <- t(sapply(rocs, ci.auc))
+auc_df$ci_low  <- ci_mat[,1]
+auc_df$ci_high <- ci_mat[,3]
+
+auc_df$model <- factor(auc_df$model, levels = models)
+write.table(auc_df, "../data/auc_df_nerd_vs_smk_exac_eclipse.txt", quote = F, row.names = F, sep = "\t")
+# ChanRev24
+DT::datatable(auc_df %>% mutate_if(is.numeric, signif, digits=3), rownames = F, options = list(scrollX=TRUE))
+```
+
+```{r}
+auc_diff_row <- function(roc_new, roc_ref) {
+  d <- as.numeric(auc(roc_new) - auc(roc_ref))
+  se <- sqrt(var(roc_new, method = "delong") + var(roc_ref, method = "delong") -
+               2 * cov(roc_new, roc_ref, method = "delong"))
+  p <- roc.test(roc_new, roc_ref, method = "delong")$p.value
+  c(diff = d, lo = d - 1.96 * se, hi = d + 1.96 * se, p = p)
+}
+fmt_num <- function(x) sprintf("%.3f", x)
+fmt_auc <- function(roc_obj) {
+  ci <- as.numeric(ci.auc(roc_obj))
+  sprintf("%.3f (%.3f, %.3f)", ci[2], ci[1], ci[3])
+}
+make_auc_table <- function(rows) {
+  do.call(rbind, lapply(names(rows), function(lbl) {
+    r <- rows[[lbl]]
+    if (is.null(r$ref)) {
+      data.frame(Model = lbl, `AUC (95% CI)` = fmt_auc(r$roc),
+                 `Difference vs reference (95% CI)` = "Reference",
+                 `P value` = "NA", check.names = FALSE)
+    } else {
+      s <- auc_diff_row(r$roc, r$ref)
+      data.frame(Model = lbl, `AUC (95% CI)` = fmt_auc(r$roc),
+                 `Difference vs reference (95% CI)` =
+                   sprintf("%s (%s, %s)", fmt_num(s["diff"]), fmt_num(s["lo"]), fmt_num(s["hi"])),
+                 `P value` = round(s["p"], 3), check.names = FALSE)
+    }
+  }))
+}
+
+auc_table <- make_auc_table(list(
+  "Prior exacerbation alone" = list(roc = roc_exac),
+  "Prior exacerbation and NERD score" = list(roc = roc_nerd_exac, ref = roc_exac)
+))
+
+auc_table
+write.table(auc_table, "../data/auc_diff_table_ECLIPSE.txt", sep = "\t", row.names = FALSE, quote = FALSE)
+```
+
+
+## quartile
+```{r message=FALSE, warning=FALSE}
+df <- df %>%
+  mutate(score_ntile = ntile(nerd_score, 4))
+
+ntile_nerd <- get_ntile_summary(df = df, outcome_name = "has_exacerbation", score = "nerd_score", covars = NULL, adjustment = "offset(log(days_followed/365))", model_type = "binomial", ntile = 4)
+ntile_nerd$score_type <- "ECLIPSE"
+
+ntile_nerd$x_base <- as.numeric(factor(ntile_nerd$ntile))
+offset_width <- 0.2
+
+ntile_nerd <- ntile_nerd %>%
+  mutate(
+    offset = case_when(
+      score_type == "ECLIPSE" ~ -offset_width
+    ),
+    x_pos = x_base + offset
+  )
+write.table(ntile_nerd, "../data/quartile_results_eclipse.txt", sep = "\t", quote = F, row.names = F)
+# ChanRev29
+DT::datatable(ntile_nerd %>% mutate_if(is.numeric, signif, digits=3), rownames = F, options = list(scrollX=TRUE))
+```
+
+```{r fig.height=5, fig.width=7}
+
+p <- ggplot(ntile_nerd, aes(x = x_pos, y = OR, color = score_type)) +
+  geom_errorbar(
+    aes(ymin = CI_lower, ymax = CI_upper), width = 0.1, linewidth = 0.8) +
+  geom_segment(aes(x = x_pos - 0.08, xend = x_pos + 0.08, y = OR, yend = OR), linewidth = 1) +
+  geom_hline(yintercept = 1, linetype = "dashed") +
+  scale_x_continuous(
+    breaks = unique(ntile_nerd$x_base),
+    labels = sort(unique(ntile_nerd$ntile))) +
+  labs(x = "Quartile", y = "Exacerbation Odds Ratio", color = "Cohort") +
+  scale_color_manual(values = c("ECLIPSE" = "#74ADD1")) +
+  theme_bw(base_size = 12)
+  
+print(p)
+```
+
+### PPV NPV
+```{r}
+df$pred_pos <- df$score_ntile == 4
+ppv_npv <- df %>%
+  summarise(
+    TP = sum(pred_pos & has_exacerbation == 1, na.rm = TRUE),
+    FP = sum(pred_pos & has_exacerbation == 0, na.rm = TRUE),
+    FN = sum(!pred_pos & has_exacerbation == 1, na.rm = TRUE),
+    TN = sum(!pred_pos & has_exacerbation == 0, na.rm = TRUE),
+    sens = TP / (TP + FN),
+    spec = TN / (TN + FP),
+    prev = mean(has_exacerbation == 1, na.rm = TRUE),  
+    PPV = (prev * sens) / ((prev * sens) + ((1 - prev) * (1 - spec))),
+    NPV = ((1 - prev) * spec) / (((1 - prev) * spec) + (prev * (1 - sens))))
+
+# ChanRev39
+ppv_npv
+write.table(ppv_npv, "../data/ppv_npv_sumtab_ec.txt", row.names = F, quote = F, sep = "\t")
+```
+
+
+## violin plot
+```{r fig.height=5, fig.width=6}
+library(ggpubr)
+
+p <- ggplot(df, aes(x = factor(has_exacerbation), y = nerd_score)) +
+  geom_violin(trim = FALSE, fill = "skyblue", alpha = 0.4) +
+  geom_boxplot(width = 0.1, outlier.shape = NA, alpha = 0.7) +
+  theme_minimal() +
+  labs(x = "Has exacerbation", y = "NERD score") +
+  stat_compare_means(method = "t.test", label.x = 1.3)
+# ChanRev19
+print(p)
+ggsave("../figures_final/nerd_score_violin_eclipse.png", plot = p, width = 6, height = 5, dpi = 600)
+ggsave("../figures_final/nerd_score_violin_eclipse.eps", plot = p, width = 6, height = 5, device = "eps")
+
+```
+
+# survival analysis 
+## cox
+```{r}
+nerd_cox <- call_coxph(df, time = "time_to_first_exac", event = "lfu_has_exac", predictor = "nerd_score", adjustment_vars=NULL)
+nerd_exac_cox <- call_coxph(df, time = "time_to_first_exac", event = "lfu_has_exac", predictor = "nerd_score", adjustment_vars="Exacerbation_Frequency")
+exac_cox <- call_coxph(df, time = "time_to_first_exac", event = "lfu_has_exac", predictor = "Exacerbation_Frequency", adjustment_vars=NULL)
+
+has_exac_cox_sumtab <- rbind(nerd_cox$result, nerd_exac_cox$result, exac_cox$result) %>%
+  mutate(outcome = "has_exacerbation")%>% 
+  dplyr::select(outcome, predictor, n_samples, n_events, hr_ci, pval, ph_pval, c_stat, c_stat_se) %>%  
+  mutate_if(is.numeric, signif, digits=3) %>%
+  mutate(model = c("NERD score only", "NERD score + prior exacerbation", "Prior exacerabtion only"),
+         predictor = c("NERD score", "NERD score", "Prior exacerabtion")) %>%
+  relocate(model, .before = predictor) %>%
+  dplyr::select(-outcome)
+rownames(has_exac_cox_sumtab) <- NULL
+
+DT::datatable(has_exac_cox_sumtab, options=list(scrollX=T))
+write.table(has_exac_cox_sumtab, "../data/survival_sumtab_has_exac_cox_ph_EC.txt", row.names = F, quote = F, sep = "\t")
+# prior exacerbation violets ph assumption
+```
+
+
+```{r}
+plot(nerd_cox$ph_test, var="nerd_score", main="Schoenfeld residual")
+plot(nerd_exac_cox$ph_test, var="nerd_score", main="Schoenfeld residual")
+plot(exac_cox$ph_test, var="Exacerbation_Frequency", main="Schoenfeld residual")
+```
+
+```{r}
+# score, pack years, prior exacerbation, smk status
+nerd_exac_py_smk_cox <- call_coxph(df, time = "time_to_first_exac", event = "lfu_has_exac", predictor = "nerd_score", 
+                                 adjustment_vars = c("Exacerbation_Frequency", "ATS_PackYears", "SmokCigNow"))
+
+nerd_exac_py_smk_cox_out <- summary(nerd_exac_py_smk_cox$model)$coefficients
+nerd_exac_py_smk_cox_ci <- confint(nerd_exac_py_smk_cox$model)
+nerd_exac_py_smk_cox_sumtab <- data.frame(
+  predictor = rownames(nerd_exac_py_smk_cox_out),
+  hr = exp(nerd_exac_py_smk_cox_out[, "coef"]),
+  ci_lower = exp(nerd_exac_py_smk_cox_ci[, 1]),
+  ci_upper = exp(nerd_exac_py_smk_cox_ci[, 2]),
+  cox_hr_ci_ECLIPSE = sprintf("%.2f (%.2f, %.2f)", exp(nerd_exac_py_smk_cox_out[, "coef"]), exp(nerd_exac_py_smk_cox_ci[, 1]), exp(nerd_exac_py_smk_cox_ci[, 2])),
+  cox_pval_ECLIPSE = nerd_exac_py_smk_cox_out[, "Pr(>|z|)"],
+  row.names = NULL
+) %>%
+  mutate(cox_pval_ECLIPSE = ifelse(cox_pval_ECLIPSE < 0.001, "<.001",
+                ifelse(cox_pval_ECLIPSE < 0.01, sub("^0", "", sprintf("%.3f", cox_pval_ECLIPSE)),
+                                    sub("^0", "", sprintf("%.2f", cox_pval_ECLIPSE))))) %>%
+  mutate(predictor = c("NERD score", "Prior exacerbation", "Pack years", "Current smoking")) %>%
+  dplyr::select(predictor, cox_hr_ci_ECLIPSE, cox_pval_ECLIPSE)
+DT::datatable(nerd_exac_py_smk_cox_sumtab)
+
+write.table(nerd_exac_py_smk_cox_sumtab, "../data/survival_sumtab_has_exac_all_vars_cox_ph_EC.txt", row.names = F, quote = F, sep = "\t")
+```
+
+## km
+```{r fig.height=6, fig.width=4.5}
+km_plot_df <- df %>%
+  dplyr::select(time_to_first_exac, lfu_has_exac, nerd_score, days_followed) %>%
+  mutate(
+    nerd_quartile = cut(nerd_score, 
+                        breaks = quantile(nerd_score, probs = seq(0, 1, 0.25), na.rm = TRUE),
+                        include.lowest = TRUE, labels = c("Q1", "Q2", "Q3", "Q4")))
+
+km_plot_df_Q1_Q4 <- km_plot_df %>% 
+  filter(nerd_quartile %in% c("Q1", "Q4")) %>%
+  mutate(nerd_quartile = droplevels(nerd_quartile))
+
+# coin for Fleming-Harrington test
+# pvalue for Q1 vs Q4
+fh_test <- logrank_test(Surv(time_to_first_exac, lfu_has_exac) ~ nerd_quartile, data = km_plot_df_Q1_Q4, type = "Fleming-Harrington", rho = 0, gamma = 1)
+
+km_fit_all <- survfit(
+  Surv(time_to_first_exac, lfu_has_exac) ~ nerd_quartile,
+  data = km_plot_df
+)
+
+time_by_q <- km_plot_df %>%
+  group_by(nerd_quartile) %>%
+  summarise(
+    time_to_event_iqr = sprintf("%.0f [%.0f, %.0f]", median(time_to_first_exac, na.rm = TRUE), 
+                        quantile(time_to_first_exac, 0.25, na.rm = TRUE), 
+                        quantile(time_to_first_exac, 0.75, na.rm = TRUE)),
+    time_followed_iqr = sprintf("%.0f [%.0f, %.0f]", median(days_followed, na.rm = TRUE), 
+                        quantile(days_followed, 0.25, na.rm = TRUE), 
+                        quantile(days_followed, 0.75, na.rm = TRUE))) %>%
+  mutate(cohort = "ECLIPSE") %>%
+  relocate(cohort)
+
+p <- ggsurvplot(
+  km_fit_all,
+  data = km_plot_df,
+  censor = TRUE,
+  xlab = "Days",
+  ylab = "Exacerbation-Free Survival",
+  title = "ECLIPSE",
+  legend.title = "NERD Quartile",
+  legend.labs = c("Q1", "Q2", "Q3", "Q4"),
+  risk.table = TRUE,
+  risk.table.title = "Number Event-Free",
+  tables.theme = theme_survminer() + 
+    theme(plot.title = element_text(size = 12)),
+  palette = c("#FFAA00", "#FF6600", "#CC0000", "#660000")
+)
+
+p$plot <- p$plot +
+  annotate("text", x = 50, y = 0.1, hjust = 0, label = sprintf("p(Q1 vs. Q4) = %.3f", pvalue(fh_test)), size = 5)
+
+print(p)
+png("../figures_final/kaplan_meier_all_q_eclipse.png", width = 4.5, height = 6, units = "in", res = 600)
+print(p)
+dev.off()
+cairo_ps("../figures_final/kaplan_meier_all_q_eclipse.eps", width = 4.5, height = 6)
+print(p)
+dev.off()
+```
+
+# stratified on prior exacerbation
+## AUC compare
+```{r}
+df_zero_exac <- df %>% filter(Exacerbation_Frequency == 0)
+df_prior_exac <- df %>% filter(Exacerbation_Frequency > 0)
+
+# nerd only
+formula_str <- "has_exacerbation ~ nerd_score + offset(log(days_followed/365))"
+model_nerd_exac1 <- glm(as.formula(formula_str), data = df_prior_exac, family = binomial())
+model_nerd_exac0 <- glm(as.formula(formula_str), data = df_zero_exac, family = binomial())
+roc_nerd_exac1 <- roc(df_prior_exac$has_exacerbation, predict(model_nerd_exac1, type = "response"))
+roc_nerd_exac0 <- roc(df_zero_exac$has_exacerbation, predict(model_nerd_exac0, type = "response"))
+```
+
+```{r}
+models <- c("NERD score no prior exacerbation", "NERD score with prior exacerbation")
+rocs <- list(roc_nerd_exac0, roc_nerd_exac1)
+
+auc_df <- data.frame(model = models, auc = sapply(rocs, auc))
+
+ci_mat <- t(sapply(rocs, ci.auc))
+auc_df$ci_low  <- ci_mat[,1]
+auc_df$ci_high <- ci_mat[,3]
+
+auc_df$model <- factor(auc_df$model, levels = models)
+auc_df
+
+write.table(auc_df, "../data/auc_df_nerd_vs_smk_prior_exac_strat_eclipse.txt", quote = F, row.names = F, sep = "\t")
+```
+
+## no prior
+```{r}
+ntile_ec_exac0 <- get_ntile_summary(df = df_zero_exac, outcome_name = "has_exacerbation", score = "nerd_score", covars = NULL, adjustment = "offset(log(days_followed/365))", model_type = "binomial", ntile = 4)
+ntile_ec_exac0$score_type <- "ECLIPSE"
+# ChanRev34
+DT::datatable(ntile_ec_exac0 %>% mutate_if(is.numeric, signif, digits=3), rownames = F, options = list(scrollX=TRUE))
+```
+
+```{r fig.height=5, fig.width=7}
+ntile_ec_exac0$x_base <- as.numeric(factor(ntile_ec_exac0$ntile))
+offset_width <- 0.2
+
+ntile_ec_exac0 <- ntile_ec_exac0 %>%
+  mutate(
+    offset = case_when(
+      score_type == "ECLIPSE" ~ offset_width
+    ),
+    x_pos = x_base + offset
+  )
+
+write.table(ntile_ec_exac0, "../data/quartile_results_eclipse_0_prior_exac.txt", sep = "\t", quote = F, row.names = F)
+```
+
+```{r}
+# no longer adjusting for prior exac
+nerd_cox_exac0 <- call_coxph(df_zero_exac, time = "time_to_first_exac", event = "lfu_has_exac", predictor = "nerd_score", adjustment_vars=NULL)
+
+has_exac_cox_sumtab_exac0 <- rbind(nerd_cox_exac0$result) %>%
+  mutate(outcome = "has_exacerbation")%>% 
+  dplyr::select(outcome, predictor, n_samples, n_events, hr_ci, pval, ph_pval, c_stat, c_stat_se) %>%  
+  mutate_if(is.numeric, signif, digits=3) %>%
+  mutate(model = c("NERD score only"),
+         predictor = c("NERD score")) %>%
+  relocate(model, .before = predictor) %>%
+  dplyr::select(-outcome)
+rownames(has_exac_cox_sumtab_exac0) <- NULL
+
+rownames(has_exac_cox_sumtab_exac0) <- NULL
+DT::datatable(has_exac_cox_sumtab_exac0, options=list(scrollX=T))
+write.table(has_exac_cox_sumtab_exac0, "../data/survival_sumtab_has_exac_no_prior_exac_cox_ph_EC.txt", row.names = F, quote = F, sep = "\t")
+```
+
+```{r}
+plot(nerd_cox_exac0$ph_test, var="nerd_score", main="Schoenfeld residual")
+```
+
+```{r fig.height=6, fig.width=4.5}
+km_plot_df_exac0 <- df_zero_exac %>%
+  dplyr::select(time_to_first_exac, lfu_has_exac, nerd_score, days_followed) %>%
+  mutate(
+    nerd_quartile = cut(nerd_score, 
+                        breaks = quantile(nerd_score, probs = seq(0, 1, 0.25), na.rm = TRUE),
+                        include.lowest = TRUE, labels = c("Q1", "Q2", "Q3", "Q4")))
+
+km_plot_df_Q1_Q4_exac0 <- km_plot_df_exac0 %>% 
+  filter(nerd_quartile %in% c("Q1", "Q4")) %>%
+  mutate(nerd_quartile = droplevels(nerd_quartile))
+
+fh_test_exac0 <- logrank_test(Surv(time_to_first_exac, lfu_has_exac) ~ nerd_quartile, data = km_plot_df_Q1_Q4_exac0, type = "Fleming-Harrington", rho = 0, gamma = 1)
+
+km_fit_exac0_all <- survfit(
+  Surv(time_to_first_exac, lfu_has_exac) ~ nerd_quartile,
+  data = km_plot_df_exac0
+)
+
+time_by_q_exac0 <- km_plot_df_exac0 %>%
+  group_by(nerd_quartile) %>%
+  summarise(
+    time_to_event_iqr = sprintf("%.0f [%.0f, %.0f]", median(time_to_first_exac, na.rm = TRUE), 
+                        quantile(time_to_first_exac, 0.25, na.rm = TRUE), 
+                        quantile(time_to_first_exac, 0.75, na.rm = TRUE)),
+    time_followed_iqr = sprintf("%.0f [%.0f, %.0f]", median(days_followed, na.rm = TRUE), 
+                        quantile(days_followed, 0.25, na.rm = TRUE), 
+                        quantile(days_followed, 0.75, na.rm = TRUE))) %>%
+  mutate(cohort = "ECLIPSE no prior exacerbations") %>%
+  relocate(cohort)
+
+p <- ggsurvplot(
+  km_fit_exac0_all,
+  data = km_plot_df_exac0,
+  censor = TRUE,
+  xlab = "Days",
+  ylab = "Exacerbation-Free Survival",
+  title = "ECLIPSE No Prior Exacerbations",
+  legend.title = "NERD Quartile",
+  legend.labs = c("Q1", "Q2", "Q3", "Q4"),
+  risk.table = TRUE,
+  risk.table.title = "Number Event-Free",
+  tables.theme = theme_survminer() + 
+    theme(plot.title = element_text(size = 12)),
+  palette = c("#FFAA00", "#FF6600", "#CC0000", "#660000")
+)
+p$plot <- p$plot +
+  annotate("text", x = 50, y = 0.1, hjust = 0, label = sprintf("p(Q1 vs. Q4) = %.3f", pvalue(fh_test_exac0)), size = 5)
+
+print(p)
+png("../figures_final/kaplan_meier_all_q_eclipse_zero_prior_exac.png", width = 4.5, height = 6, units = "in", res = 600)
+print(p)
+dev.off()
+cairo_ps("../figures_final/kaplan_meier_all_q_eclipse_zero_prior_exac.eps", width = 4.5, height = 6)
+print(p)
+dev.off()
+```
+
+## with prior
+```{r}
+ntile_ec_exac1 <- get_ntile_summary(df = df_prior_exac, outcome_name = "has_exacerbation", score = "nerd_score", covars = NULL, adjustment = "offset(log(days_followed/365))", model_type = "binomial", ntile = 4)
+ntile_ec_exac1$score_type <- "ECLIPSE"
+
+DT::datatable(ntile_ec_exac1 %>% mutate_if(is.numeric, signif, digits=3), rownames = F, options = list(scrollX=TRUE))
+```
+
+```{r fig.height=5, fig.width=7}
+ntile_ec_exac1$x_base <- as.numeric(factor(ntile_ec_exac1$ntile))
+offset_width <- 0.2
+
+ntile_ec_exac1 <- ntile_ec_exac1 %>%
+  mutate(
+    offset = case_when(
+      score_type == "ECLIPSE" ~ offset_width
+    ),
+    x_pos = x_base + offset
+  )
+
+write.table(ntile_ec_exac1, "../data/quartile_results_eclipse_with_prior_exac.txt", sep = "\t", quote = F, row.names = F)
+```
+
+```{r}
+# no longer adjusting for prior exac
+nerd_cox_exac1 <- call_coxph(df_prior_exac, time = "time_to_first_exac", event = "lfu_has_exac", predictor = "nerd_score", adjustment_vars=NULL)
+
+has_exac_cox_sumtab_exac1 <- rbind(nerd_cox_exac1$result) %>%
+  mutate(outcome = "has_exacerbation")%>% 
+  dplyr::select(outcome, predictor, n_samples, n_events, hr_ci, pval, ph_pval, c_stat, c_stat_se) %>%  
+  mutate_if(is.numeric, signif, digits=3) %>%
+  mutate(model = c("NERD score only"),
+         predictor = c("NERD score")) %>%
+  relocate(model, .before = predictor) %>%
+  dplyr::select(-outcome)
+rownames(has_exac_cox_sumtab_exac1) <- NULL
+
+rownames(has_exac_cox_sumtab_exac1) <- NULL
+DT::datatable(has_exac_cox_sumtab_exac1, options=list(scrollX=T))
+write.table(has_exac_cox_sumtab_exac1, "../data/survival_sumtab_has_exac_with_prior_exac_cox_ph_EC.txt", row.names = F, quote = F, sep = "\t")
+```
+
+```{r}
+plot(nerd_cox_exac1$ph_test, var="nerd_score", main="Schoenfeld residual")
+```
+
+```{r fig.height=6, fig.width=4.5}
+km_plot_df_exac1 <- df_prior_exac %>%
+  dplyr::select(time_to_first_exac, lfu_has_exac, nerd_score, days_followed) %>%
+  mutate(
+    nerd_quartile = cut(nerd_score, 
+                        breaks = quantile(nerd_score, probs = seq(0, 1, 0.25), na.rm = TRUE),
+                        include.lowest = TRUE, labels = c("Q1", "Q2", "Q3", "Q4")))
+
+km_plot_df_Q1_Q4_exac1 <- km_plot_df_exac1 %>% 
+  filter(nerd_quartile %in% c("Q1", "Q4")) %>%
+  mutate(nerd_quartile = droplevels(nerd_quartile))
+
+fh_test_exac1 <- logrank_test(Surv(time_to_first_exac, lfu_has_exac) ~ nerd_quartile, data = km_plot_df_Q1_Q4_exac1, type = "Fleming-Harrington", rho = 0, gamma = 1)
+
+km_fit_exac1_all <- survfit(
+  Surv(time_to_first_exac, lfu_has_exac) ~ nerd_quartile,
+  data = km_plot_df_exac1
+)
+
+time_by_q_exac1 <- km_plot_df_exac1 %>%
+  group_by(nerd_quartile) %>%
+  summarise(
+    time_to_event_iqr = sprintf("%.0f [%.0f, %.0f]", median(time_to_first_exac, na.rm = TRUE), 
+                        quantile(time_to_first_exac, 0.25, na.rm = TRUE), 
+                        quantile(time_to_first_exac, 0.75, na.rm = TRUE)),
+    time_followed_iqr = sprintf("%.0f [%.0f, %.0f]", median(days_followed, na.rm = TRUE), 
+                        quantile(days_followed, 0.25, na.rm = TRUE), 
+                        quantile(days_followed, 0.75, na.rm = TRUE))) %>%
+  mutate(cohort = "ECLIPSE with prior exacerbations") %>%
+  relocate(cohort)
+
+p <- ggsurvplot(
+  km_fit_exac1_all,
+  data = km_plot_df_exac1,
+  censor = TRUE,
+  xlab = "Days",
+  ylab = "Exacerbation-Free Survival",
+  title = "ECLIPSE With Prior Exacerbations",
+  legend.title = "NERD Quartile",
+  legend.labs = c("Q1", "Q2", "Q3", "Q4"),
+  risk.table = TRUE,
+  risk.table.title = "Number Event-Free",
+  tables.theme = theme_survminer() + 
+    theme(plot.title = element_text(size = 12)),
+  palette = c("#FFAA00", "#FF6600", "#CC0000", "#660000")
+)
+p$plot <- p$plot +
+  annotate("text", x = 50, y = 0.1, hjust = 0, label = sprintf("p(Q1 vs. Q4) = %.3f", pvalue(fh_test_exac1)), size = 5)
+
+print(p)
+png("../figures_final/kaplan_meier_all_q_eclipse_with_prior_exac.png", width = 4.5, height = 6, units = "in", res = 600)
+print(p)
+dev.off()
+cairo_ps("../figures_final/kaplan_meier_all_q_eclipse_with_prior_exac.eps", width = 4.5, height = 6)
+print(p)
+dev.off()
+```
+
+# sumtabs
+## n subject n event
+```{r}
+n_exac_sumtab <- tibble(
+  cohort = c("ECLIPSE", "ECLIPSE no prior exacerbations", "ECLIPSE with prior exacerbations"),
+  n = c(nrow(df), nrow(df_prior_exac), nrow(df_zero_exac)),
+  n_has_exacerbation = c(sum(df$has_exacerbation, na.rm = TRUE),
+                          sum(df_prior_exac$has_exacerbation, na.rm = TRUE),
+                          sum(df_zero_exac$has_exacerbation, na.rm = TRUE))
+)
+DT::datatable(n_exac_sumtab)
+write.table(n_exac_sumtab, "../data/n_subj_n_event_EC.txt", row.names = F, quote = F, sep = "\t")
+```
+
+## table one additional
+```{r}
+vars_to_fix <- c("FEV1pp_utah", "FVCpp_utah", "days_followed")
+
+df2 <- df %>% mutate(
+    nerd_quartile = cut(nerd_score, 
+                        breaks = quantile(nerd_score, probs = seq(0, 1, 0.25), na.rm = TRUE),
+                        include.lowest = TRUE, labels = c("Q1", "Q2", "Q3", "Q4")))
+
+table1_fix <- CreateTableOne(vars = vars_to_fix, strata = "nerd_quartile", data = df2, test = TRUE, addOverall = T)
+print(table1_fix, nonnormal = vars_to_fix, showAllLevels = TRUE, quote = FALSE, noSpaces = TRUE)
+```
+
+## time by quartile
+```{r}
+time_by_q_ec <- rbind(time_by_q, time_by_q_exac0, time_by_q_exac1)
+DT::datatable(time_by_q_ec)
+write.table(time_by_q_ec, "../data/time_to_event_by_score_quartile_EC.txt", row.names = F, quote = F, sep = "\t")
+```
